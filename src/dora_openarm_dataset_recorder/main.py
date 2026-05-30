@@ -49,6 +49,8 @@ class Episode:
     elevation_actions: ArrayLike = field(default_factory=list)
     elevation_observation_timestamps: ArrayLike = field(default_factory=list)
     elevation_observations: ArrayLike = field(default_factory=list)
+    right_poses: ArrayLike = field(default_factory=list)
+    left_poses: ArrayLike = field(default_factory=list)
 
 
 class EpisodeWriter:
@@ -75,28 +77,32 @@ class EpisodeWriter:
     def finish(self):
         """Write all pending data."""
         if self._episode.right_actions:
-            self._write_positions(
-                self._base_directory / "action" / "arms" / "right" / "qpos.parquet",
+            self._write_observations(
+                self._base_directory / "action" / "arms" / "right",
                 self._episode.right_action_timestamps,
                 self._episode.right_actions,
+                self._episode.right_poses,
             )
         if self._episode.right_observations:
             self._write_observations(
                 self._base_directory / "obs" / "arms" / "right",
                 self._episode.right_observation_timestamps,
                 self._episode.right_observations,
+                self._episode.right_poses,
             )
         if self._episode.left_actions:
-            self._write_positions(
-                self._base_directory / "action" / "arms" / "left" / "qpos.parquet",
+            self._write_observations(
+                self._base_directory / "action" / "arms" / "left",
                 self._episode.left_action_timestamps,
                 self._episode.left_actions,
+                self._episode.left_poses,
             )
         if self._episode.left_observations:
             self._write_observations(
                 self._base_directory / "obs" / "arms" / "left",
                 self._episode.left_observation_timestamps,
                 self._episode.left_observations,
+                self._episode.left_poses,
             )
         if self._episode.elevation_actions:
             self._write_positions(
@@ -126,26 +132,35 @@ class EpisodeWriter:
         )
         pq.write_table(table, output_path)
 
-    def _write_states(self, output_path, timestamps, states):
+    def _write_states(self, output_path, timestamps, states, poses=None):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         list_type = pa.list_(pa.float32())
-        table = pa.table(
-            {
-                "timestamp": pa.array(timestamps, type=pa.timestamp("ns")),
-                "qpos": pa.array([s.field("qpos") for s in states], type=list_type),
-                "qvel": pa.array([s.field("qvel") for s in states], type=list_type),
-                "qtorque": pa.array(
-                    [s.field("qtorque") for s in states], type=list_type
-                ),
-            }
-        )
-        pq.write_table(table, output_path)
+        names = states[0].type.names
+        # The action struct names the position field "new_position" while the
+        # observation struct uses "qpos"; both map to the "qpos" column.
+        pos_field = "qpos" if "qpos" in names else "new_position"
+        columns = {
+            "timestamp": pa.array(timestamps, type=pa.timestamp("ns")),
+            "qpos": pa.array([s.field(pos_field) for s in states], type=list_type),
+        }
+        if "qvel" in names:
+            columns["qvel"] = pa.array(
+                [s.field("qvel") for s in states], type=list_type
+            )
+        if "qtorque" in names:
+            columns["qtorque"] = pa.array(
+                [s.field("qtorque") for s in states], type=list_type
+            )
+        # Pose pairs 1:1 by index with the rows; only attach it when aligned.
+        if poses and len(poses) == len(timestamps):
+            columns["pose"] = pa.array(poses, type=list_type)
+        pq.write_table(pa.table(columns), output_path)
 
-    def _write_observations(self, base_path, timestamps, observations):
+    def _write_observations(self, base_path, timestamps, observations, poses=None):
         first = observations[0]
         if isinstance(first, pa.StructArray):
             output_path = base_path / "state.parquet"
-            self._write_states(output_path, timestamps, observations)
+            self._write_states(output_path, timestamps, observations, poses)
         else:
             output_path = base_path / "qpos.parquet"
             self._write_positions(output_path, timestamps, observations)
@@ -154,7 +169,7 @@ class EpisodeWriter:
 class DatasetWriter:
     """Write a dataset."""
 
-    _VERSION = "0.3.0"
+    _VERSION = "0.4.0"
 
     def __init__(self, directory, name, metadata):
         """Initialize variables."""
@@ -353,9 +368,9 @@ def main():
             # Convert to POSIX timestamp in nanosecond.
             timestamp = math.ceil(timestamp.timestamp() * 1_000_000_000)
         if event_id.startswith("arm_"):
+            # The full struct (qpos/qvel/qtorque) is kept for both action and
+            # observation streams so velocity/torque are not dropped.
             value = event["value"]
-            if isinstance(value, pa.StructArray) and "new_position" in value.type.names:
-                value = value.field("new_position")
 
             # arm_right_action ->
             # right_action
@@ -368,6 +383,10 @@ def main():
             # right_action_timestamps
             timestamps_key = f"{key_prefix}_timestamps"
             getattr(episode, timestamps_key).append(timestamp)
+        elif event_id.startswith("pose_"):
+            # pose_right -> right_poses, pose_left -> left_poses
+            side = event_id.removeprefix("pose_")
+            getattr(episode, f"{side}_poses").append(event["value"])
         elif event_id.startswith("elevation_"):
             # elevation_observation -> elevation_observations, elevation_observation_timestamps
             # elevation_action -> elevation_actions, elevation_action_timestamps
